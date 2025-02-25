@@ -1,9 +1,11 @@
 package com.searchscale.lucene.cuvs.benchmarks;
 
+import java.io.BufferedInputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.UncheckedIOException;
 import java.lang.invoke.MethodHandles;
 import java.nio.charset.Charset;
 import java.nio.file.FileVisitOption;
@@ -16,6 +18,7 @@ import java.util.Arrays;
 import java.util.Calendar;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -23,17 +26,19 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.ZipFile;
 
+import com.fasterxml.jackson.databind.MapperFeature;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
 import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.FilterCodec;
 import org.apache.lucene.codecs.KnnVectorsFormat;
 import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.KnnVectorsWriter;
@@ -50,9 +55,12 @@ import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
-import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.sandbox.vectorsearch.CuVSCodec;
 import org.apache.lucene.sandbox.vectorsearch.CuVSKnnFloatVectorQuery;
+import org.apache.lucene.sandbox.vectorsearch.CuVSVectorsFormat;
+import org.apache.lucene.sandbox.vectorsearch.CuVSVectorsWriter;
+import org.apache.lucene.sandbox.vectorsearch.CuVSVectorsWriter.MergeStrategy;
+import org.apache.lucene.sandbox.vectorsearch.CuVSVectorsWriter.IndexType;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.KnnFloatVectorQuery;
 import org.apache.lucene.search.ScoreDoc;
@@ -74,6 +82,8 @@ import com.fasterxml.jackson.dataformat.csv.CsvSchema;
 import com.opencsv.CSVReader;
 import com.opencsv.exceptions.CsvValidationException;
 
+import static org.apache.lucene.index.VectorSimilarityFunction.EUCLIDEAN;
+
 public class LuceneCuvsBenchmarks {
 
   private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
@@ -84,7 +94,7 @@ public class LuceneCuvsBenchmarks {
   @SuppressWarnings("resource")
   public static void main(String[] args) throws Throwable {
     BenchmarkConfiguration config = new ObjectMapper().readValue(new File(args[0]), BenchmarkConfiguration.class);
-    Map<String, Object> metrics = new HashMap<String, Object>();
+    Map<String, Object> metrics = new LinkedHashMap<String, Object>();
     List<QueryResult> queryResults = Collections.synchronizedList(new ArrayList<QueryResult>());
     config.debugPrintArguments();
     
@@ -121,11 +131,11 @@ public class LuceneCuvsBenchmarks {
     // [2] Benchmarking setup
 
     // HNSW Writer:
-    IndexWriterConfig hnswWriterConfig = new IndexWriterConfig(new StandardAnalyzer());
-    hnswWriterConfig.setCodec(getHnswCodec(config));
-    hnswWriterConfig.setUseCompoundFile(false);
-    hnswWriterConfig.setMaxBufferedDocs(config.commitFreq);
-    hnswWriterConfig.setRAMBufferSizeMB(IndexWriterConfig.DISABLE_AUTO_FLUSH);
+    IndexWriterConfig luceneHNSWWriterConfig = new IndexWriterConfig(new StandardAnalyzer());
+    luceneHNSWWriterConfig.setCodec(getLuceneHnswCodec(config));
+    luceneHNSWWriterConfig.setUseCompoundFile(false);
+    luceneHNSWWriterConfig.setMaxBufferedDocs(config.flushFreq);
+    luceneHNSWWriterConfig.setRAMBufferSizeMB(IndexWriterConfig.DISABLE_AUTO_FLUSH);
 
     // CuVS Writer:
     // IndexWriterConfig cuvsIndexWriterConfig = new IndexWriterConfig(new
@@ -133,22 +143,22 @@ public class LuceneCuvsBenchmarks {
     // config.cuvsWriterThreads, config.cagraIntermediateGraphDegree,
     // config.cagraGraphDegree, config.mergeStrategy));
     IndexWriterConfig cuvsIndexWriterConfig = new IndexWriterConfig(new StandardAnalyzer());
-    cuvsIndexWriterConfig.setCodec(new CuVSCodec());
+    cuvsIndexWriterConfig.setCodec(getCuVSCodec(config));
     cuvsIndexWriterConfig.setUseCompoundFile(false);
-    cuvsIndexWriterConfig.setMaxBufferedDocs(config.commitFreq);
+    cuvsIndexWriterConfig.setMaxBufferedDocs(config.flushFreq);
     cuvsIndexWriterConfig.setRAMBufferSizeMB(IndexWriterConfig.DISABLE_AUTO_FLUSH);
 
     if (INDEX_WRITER_INFO_STREAM) {
-      hnswWriterConfig.setInfoStream(new PrintStreamInfoStream(System.out));
+      luceneHNSWWriterConfig.setInfoStream(new PrintStreamInfoStream(System.out));
       cuvsIndexWriterConfig.setInfoStream(new PrintStreamInfoStream(System.out));
     }
 
 //    if (config.mergeStrategy.equals(MergeStrategy.NON_TRIVIAL_MERGE)) {
-//      hnswWriterConfig.setMergePolicy(NoMergePolicy.INSTANCE);
+//      luceneHNSWWriterConfig.setMergePolicy(NoMergePolicy.INSTANCE);
 //      cuvsIndexWriterConfig.setMergePolicy(NoMergePolicy.INSTANCE);
 //    }
 
-    IndexWriter hnswIndexWriter;
+    IndexWriter luceneHnswIndexWriter;
     IndexWriter cuvsIndexWriter;
 
     if (!config.createIndexInMemory) {
@@ -158,10 +168,10 @@ public class LuceneCuvsBenchmarks {
         FileUtils.deleteDirectory(hnswIndex.toFile());
         FileUtils.deleteDirectory(cuvsIndex.toFile());
       }
-      hnswIndexWriter = new IndexWriter(FSDirectory.open(hnswIndex), hnswWriterConfig);
+      luceneHnswIndexWriter = new IndexWriter(FSDirectory.open(hnswIndex), luceneHNSWWriterConfig);
       cuvsIndexWriter = new IndexWriter(FSDirectory.open(cuvsIndex), cuvsIndexWriterConfig);
     } else {
-      hnswIndexWriter = new IndexWriter(new ByteBuffersDirectory(), hnswWriterConfig);
+      luceneHnswIndexWriter = new IndexWriter(new ByteBuffersDirectory(), luceneHNSWWriterConfig);
       cuvsIndexWriter = new IndexWriter(new ByteBuffersDirectory(), cuvsIndexWriterConfig);
     }
 
@@ -169,9 +179,9 @@ public class LuceneCuvsBenchmarks {
 
     if ("ALL".equalsIgnoreCase(config.algoToRun)) {
       writers.add(cuvsIndexWriter);
-      writers.add(hnswIndexWriter);
+      writers.add(luceneHnswIndexWriter);
     } else if ("HNSW".equalsIgnoreCase(config.algoToRun)) {
-      writers.add(hnswIndexWriter);
+      writers.add(luceneHnswIndexWriter);
     } else if ("CAGRA".equalsIgnoreCase(config.algoToRun)) {
       writers.add(cuvsIndexWriter);
     } else {
@@ -179,14 +189,13 @@ public class LuceneCuvsBenchmarks {
     }
 
     for (IndexWriter writer : writers) {
-      Codec codec = writer.getConfig().getCodec();
-      String codecName = codec.getClass().getSimpleName().isEmpty() ? codec.getClass().getSuperclass().getSimpleName()
-          : codec.getClass().getSimpleName();
-      log.info("----------\nIndexing documents using {} ...", codecName); // error for different coloring
+      var formatName = writer.getConfig().getCodec().knnVectorsFormat().getName();
+      boolean isCuVS = formatName.equals("CuVSVectorsFormat");
+      log.info("----------\nIndexing documents using {} ...", formatName); // error for different coloring
       long indexStartTime = System.currentTimeMillis();
-      indexDocuments(writer, config, titles, vectorColumn, config.commitFreq);
+      indexDocuments(writer, config, titles, vectorColumn);
       long indexTimeTaken = System.currentTimeMillis() - indexStartTime;
-      if (codec instanceof CuVSCodec) {
+      if (isCuVS) {
         metrics.put("cuvs-indexing-time", indexTimeTaken);
       } else {
         metrics.put("hnsw-indexing-time", indexTimeTaken);
@@ -195,7 +204,7 @@ public class LuceneCuvsBenchmarks {
       log.info("Time taken for index building (end to end): " + indexTimeTaken + " ms");
 
       try {
-        if (hnswIndexWriter.getDirectory() instanceof FSDirectory
+        if (luceneHnswIndexWriter.getDirectory() instanceof FSDirectory
             && cuvsIndexWriter.getDirectory() instanceof FSDirectory) {
           Path indexPath = writer == cuvsIndexWriter ? Paths.get(config.cuvsIndexDirPath) : Paths.get(config.hnswIndexDirPath);
           long directorySize;
@@ -216,8 +225,8 @@ public class LuceneCuvsBenchmarks {
         log.error("Failed to calculate directory size for {}", writer == cuvsIndexWriter ? config.cuvsIndexDirPath : config.hnswIndexDirPath,
             e);
       }
-      log.info("Querying documents using {}...", codecName); // error for different coloring
-      query(writer.getDirectory(), config, codec instanceof CuVSCodec, metrics, queryResults,
+      log.info("Querying documents using {}...", formatName); // error for different coloring
+      query(writer.getDirectory(), config, isCuVS, metrics, queryResults,
           readGroundTruthFile(config.groundTruthFile, config.numDocs));
     }
 
@@ -290,6 +299,8 @@ public class LuceneCuvsBenchmarks {
     titles.add(config.vectorColName);
   }
 
+  private static final int DEFAULT_BUFFER_SIZE = 65536;
+
   private static void parseCSVFile(BenchmarkConfiguration config, List<String> titles, List<float[]> vectorColumn)
       throws IOException, CsvValidationException {
     InputStreamReader isr = null;
@@ -298,9 +309,13 @@ public class LuceneCuvsBenchmarks {
       zipFile = new ZipFile(config.datasetFile);
       isr = new InputStreamReader(zipFile.getInputStream(zipFile.entries().nextElement()));
     } else if (config.datasetFile.endsWith(".gz")) {
-      isr = new InputStreamReader(new GZIPInputStream(new FileInputStream(config.datasetFile)));
+      var fis = new FileInputStream(config.datasetFile);
+      var bis = new BufferedInputStream(fis, DEFAULT_BUFFER_SIZE);
+      isr = new InputStreamReader(new GZIPInputStream(bis));
     } else {
-      isr = new InputStreamReader(new FileInputStream(config.datasetFile));
+      var fis = new FileInputStream(config.datasetFile);
+      var bis = new BufferedInputStream(fis, DEFAULT_BUFFER_SIZE);
+      isr = new InputStreamReader(bis);
     }
 
     try (CSVReader csvReader = new CSVReader(isr)) {
@@ -331,51 +346,35 @@ public class LuceneCuvsBenchmarks {
 
 
   private static void indexDocuments(IndexWriter writer, BenchmarkConfiguration config, List<String> titles,
-      List<float[]> vecCol, int commitFrequency) throws IOException, InterruptedException {
+      List<float[]> vecCol) throws IOException, InterruptedException {
 
-    int threads = writer.getConfig().getCodec() instanceof CuVSCodec ? 1 : config.hnswThreads;
+    int threads = config.numIndexThreads;
     ExecutorService pool = Executors.newFixedThreadPool(threads);
-    AtomicInteger docsIndexed = new AtomicInteger(0);
-    AtomicInteger remainingDocs = new AtomicInteger(0);
-    AtomicBoolean commitBeingCalled = new AtomicBoolean(false);
+    AtomicInteger numDocsIndexed = new AtomicInteger(0);
+    System.out.println("Starting indexing with " + threads + " threads.");
+    final int numDocsToIndex = config.numDocs;
 
-    for (int i = 0; i <= config.numDocs; i++) {
-      final int index = i;
+    for (int i = 0; i <= threads; i++) {
       pool.submit(() -> {
-        Document document = new Document();
-        document.add(new StringField("id", String.valueOf(index), Field.Store.YES));
-        if (RESULTS_DEBUGGING)
-          document.add(new StringField("title", titles.get(index), Field.Store.YES));
-        document
-            .add(new KnnFloatVectorField(config.vectorColName, vecCol.get(index), VectorSimilarityFunction.EUCLIDEAN));
-        try {
-          while (commitBeingCalled.get())
-            ; // block until commit is over
-          writer.addDocument(document);
-          int docs = docsIndexed.incrementAndGet();
-          remainingDocs.incrementAndGet();
-          // if (docs % 100 == 0) log.info("Docs added: " + docs);
-
-          synchronized (pool) {
-
-            if ((docs % commitFrequency == 0) && !commitBeingCalled.get()) {
-              log.info(docs + " Docs indexed. Commit called..." + index);
-              if (commitBeingCalled.get() == false) {
-                try {
-                  commitBeingCalled.set(true);
-                  writer.commit();
-                  remainingDocs.set(0);
-                  commitBeingCalled.set(false);
-                } catch (IOException ex) {
-                  ex.printStackTrace();
-                }
-              }
-              log.info(docs + ": Done commit!");
-            }
+        while (true) {
+          int id = numDocsIndexed.getAndIncrement();
+          if (id >= numDocsToIndex) {
+            break; // done
           }
 
-        } catch (IOException ex) {
-          ex.printStackTrace();
+          Document doc = new Document();
+          doc.add(new StringField("id", String.valueOf(id), Field.Store.YES));
+          if (RESULTS_DEBUGGING)
+            doc.add(new StringField("title", titles.get(id), Field.Store.YES));
+          doc.add(new KnnFloatVectorField(config.vectorColName, vecCol.get(id), EUCLIDEAN));
+          try {
+            writer.addDocument(doc);
+            if ((id + 1) % 25000 == 0) {
+              System.out.println("Done indexing " + (id + 1) + " documents.");
+            }
+          } catch (IOException ex) {
+            throw new UncheckedIOException(ex);
+          }
         }
       });
 
@@ -383,12 +382,10 @@ public class LuceneCuvsBenchmarks {
     pool.shutdown();
     pool.awaitTermination(Long.MAX_VALUE, TimeUnit.SECONDS);
 
-    // HERE IS THE PROBLEM!
-    if (remainingDocs.get() != 0) {
-      log.info("{} Docs remaining. Calling commit.", remainingDocs.get());
-      writer.commit();
-    }
-
+    //log.info("Calling forceMerge(1).");
+    //writer.forceMerge(1);
+    log.info("Calling commit.");
+    writer.commit();
     writer.close();
   }
 
@@ -445,7 +442,10 @@ public class LuceneCuvsBenchmarks {
     @Override
     public String toString() {
       try {
-        return new ObjectMapper().writeValueAsString(this);
+        var objectMapper = new ObjectMapper();
+        objectMapper.configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
+        objectMapper.configure(MapperFeature.SORT_PROPERTIES_ALPHABETICALLY, true);
+        return objectMapper.writeValueAsString(this);
       } catch (JsonProcessingException e) {
         throw new RuntimeException("Problem with converting the result to a string", e);
       }
@@ -538,10 +538,9 @@ public class LuceneCuvsBenchmarks {
             }
             scores.add(hit.score);
           }
-          
-          QueryResult result = new QueryResult(useCuVS ? "lucene_cuvs" : "lucene_hnsw", queryId,
-              useCuVS ? neighbors.reversed() : neighbors, groundTruth.get(queryId),
-              useCuVS ? scores.reversed() : scores, searchTimeTakenMs);
+
+          var s = useCuVS ? "lucene_cuvs" : "lucene_hnsw";
+          QueryResult result = new QueryResult(s, queryId, neighbors, groundTruth.get(queryId), scores, searchTimeTakenMs);
           queryResults.add(result);
         });
       }
@@ -563,14 +562,42 @@ public class LuceneCuvsBenchmarks {
     }
   }
 
-  private static Lucene101Codec getHnswCodec(BenchmarkConfiguration config) {
+  private static Lucene101Codec getLuceneHnswCodec(BenchmarkConfiguration config) {
     return new Lucene101Codec(Mode.BEST_SPEED) {
+      static final int DEFAULT_MAX_CONN = Lucene99HnswVectorsFormat.DEFAULT_MAX_CONN; // 16
+      static final int DEFAULT_BEAM_WIDTH = Lucene99HnswVectorsFormat.DEFAULT_BEAM_WIDTH; // 100
+
       @Override
       public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
         KnnVectorsFormat knnFormat = new Lucene99HnswVectorsFormat(config.hnswMaxConn, config.hnswBeamWidth);
+        // KnnVectorsFormat knnFormat = new Lucene99HnswVectorsFormat(DEFAULT_MAX_CONN, DEFAULT_BEAM_WIDTH);
         return new HighDimensionKnnVectorsFormat(knnFormat, config.vectorDimension);
       }
     };
+  }
+
+  private static Codec getCuVSCodec(BenchmarkConfiguration config) {
+    return new CuVSCodec();
+  }
+
+  static final class CuVSCodec  extends FilterCodec {
+
+    static final int CUVS_WRITER_THREADS = 32;
+
+    static final KnnVectorsFormat KNN_FORMAT = new CuVSVectorsFormat(CUVS_WRITER_THREADS, 128, 64, MergeStrategy.NON_TRIVIAL_MERGE, IndexType.CAGRA);
+
+    CuVSCodec() {
+      this("CuVSCodec", new Lucene101Codec());
+    }
+
+    private CuVSCodec(String name, Codec delegate) {
+      super(name, delegate);
+    }
+
+    @Override
+    public KnnVectorsFormat knnVectorsFormat() {
+      return KNN_FORMAT;
+    }
   }
 
   private static float[] parseFloatArrayFromStringArray(String str) {

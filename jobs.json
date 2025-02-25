@@ -7,7 +7,7 @@
    "vectorDimension" : 2048,
    "queryFile" : "/data/queries_100.csv",
    "numQueriesToRun" : 100,
-   "commitFreq" : 2000,
+   "flushFreq" : 200000,
    "topK" : 64,
    "hnswThreads" : 32,
    "cuvsWriterThreads" : 32,

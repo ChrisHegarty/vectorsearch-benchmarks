@@ -11,9 +11,9 @@ public class BenchmarkConfiguration {
   public int vectorDimension;
   public String queryFile;
   public int numQueriesToRun;
-  public int commitFreq;
+  public int flushFreq;
   public int topK;
-  public int hnswThreads;
+  public int numIndexThreads;
   public int cuvsWriterThreads;
   public int queryThreads;
   public boolean createIndexInMemory;
@@ -47,9 +47,10 @@ public class BenchmarkConfiguration {
     System.out.println("Number of dimensions are: " + vectorDimension);
     System.out.println("Query file used is: " + queryFile);
     System.out.println("Number of queries to run: " + numQueriesToRun);
-    System.out.println("Commit frequency (every n documents): " + commitFreq);
+    System.out.println("Flush frequency (every n documents): " + flushFreq);
     System.out.println("TopK value is: " + topK);
-    System.out.println("Lucene HNSW threads: " + hnswThreads);
+    System.out.println("numIndexThreads is: " + numIndexThreads);
+    //System.out.println("Lucene HNSW threads: " + hnswThreads);
 //    System.out.println("cuVS Merge strategy: " + mergeStrategy);
     System.out.println("Query threads: " + queryThreads);
     System.out.println("Create index in memory: " + createIndexInMemory);
